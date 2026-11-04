@@ -24,6 +24,7 @@ import {
   pickBenchTestCommands,
   plant,
   readBenchKeys,
+  readBenchProvider,
   repoint,
   readBenchSetupLabels,
   scrub,
@@ -816,7 +817,10 @@ describe('prices', () => {
     readBenchKeys(file);
     const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('ok'));
     try {
-      expect(await Promise.all(['codex:luna', 'opencode:luna'].map(whyPointUnready))).toEqual([undefined, undefined]);
+      expect(await Promise.all(['codex:luna', 'opencode:luna'].map(point => whyPointUnready(point)))).toEqual([
+        undefined,
+        undefined,
+      ]);
       expect(fetch.mock.calls.map(call => (call[1]!.headers as Record<string, string>).authorization)).toEqual([
         'Bearer FAKE-shell-key',
         'Bearer FAKE-shell-key',
@@ -824,6 +828,25 @@ describe('prices', () => {
     } finally {
       fetch.mockRestore();
     }
+  });
+
+  it('checks a point against the provider that serves it, without asking the proxy', async () => {
+    const fetch = vi.spyOn(globalThis, 'fetch');
+    const provider = { name: 'claude', harnesses: ['claude'] };
+    try {
+      expect(
+        await Promise.all(
+          ['claude:claude-sonnet-5-5', 'opencode:luna', 'claude:nope'].map(point => whyPointUnready(point, provider))
+        )
+      ).toEqual([undefined, 'opencode:luna: claude does not serve opencode', 'claude:nope: no list price for nope']);
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it('names a provider the engine config does not have', async () => {
+    await expect(readBenchProvider('nobody')).rejects.toThrow(/has no provider nobody/);
   });
 
   it('prices tokens at list price, with cache priced as input too, and names the models it cannot price', () => {

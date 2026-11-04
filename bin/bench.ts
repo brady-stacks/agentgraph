@@ -2,12 +2,13 @@
  * Replays merged pull requests as bench runs and scores them. Each command works on one slot of a set: the case, arm,
  * repeat, point and graph pick it, and every try of it is a numbered attempt dir with its own graph, tracker and data.
  * Usage: node bin/bench.ts run (v2|floor) <case dir> <set> --repo <clone> [--point harness:model] [--repeat k] [--graph dir]
+ *        [--provider name]
  *        node bin/bench.ts import (human|base|control) <case dir> <set> --repo <clone> [--repeat k]
  *        node bin/bench.ts score <arm> <case dir> <set> --repo <clone> [same slot flags]
  *        node bin/bench.ts judge <arm> <case dir> <set> [same slot flags] [--judges opus:1,sonnet:2]
  * Scores and judgements are later results on the slot's run, versioned by what produced them, so a rerun skips a
  * current one. Paid steps stop past --max-codex weekly Codex percent, or after --max-claude-calls judge calls. Model
- * keys come from --keys, infra/local/.keys.env by default.
+ * keys come from --keys, infra/local/.keys.env by default; --provider runs arms on a provider's login instead.
  */
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -17,7 +18,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { getSha } from '../src/hash.ts';
 import { parseArgs, parseEnv, stripVTControlCharacters } from 'node:util';
-import { Effect } from 'effect';
+import { ConfigProvider, Effect } from 'effect';
 import { dockerArgs, readImage, type CheckoutContainerSpec } from '../src/docker.ts';
 import { isModelPriced, readPrices, type TokenCounts } from '../src/prices.ts';
 import { dependencyDirs, discard, readSandboxSetup, createSharedMounts, manifest, written } from '../src/env.ts';
@@ -32,7 +33,7 @@ import { addGraphArgs } from '../src/git.ts';
 import { writeComment, writeImportedRun } from '../src/instance.ts';
 import { appendJsonlRows, readJsonlRows, writeFileAtomic } from '../src/store.ts';
 import { parseLabelPatch, parseLabels, writeRunLabels } from '../src/labels.ts';
-import { parseNamePairs } from '../src/harnesses.ts';
+import { makeHarnessConfigProvider, parseNamePairs, readHarnessSettings, type Provider } from '../src/harnesses.ts';
 import {
   agentgraphDir,
   appendJsonl,
@@ -110,6 +111,7 @@ const options = {
   repeat: 1,
   graph: undefined as string | undefined,
   labels: parseLabels({}),
+  provider: undefined as Provider | undefined,
 };
 let panel: Record<string, number> = { opus: 1, sonnet: 2, sol: 2 };
 const testPath = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.\w+$|_tests?\.\w+$/;
@@ -496,6 +498,7 @@ const makeArmRunLabels = (input: BenchInput) => {
     case: input.case,
     arm: input.arm,
     ...(harness && model && { harness, model }),
+    ...(options.provider && { provider: options.provider.name }),
     repeat: String(input.repeat),
     engine: sh('git', ['-C', agentgraphDir, 'rev-parse', 'HEAD']).trim(),
     ...options.labels,
@@ -614,7 +617,14 @@ const engineArm = async (c: Case & Commands, arm: string, at: string, repo: stri
   let reason: string | undefined;
   for (let pass = 0; pass < 6; pass++) {
     const [run] = await start(
-      { graph, issue: 1, data: join(at, 'data'), meta: makeBenchMeta(set, input), labels: makeArmRunLabels(input) },
+      {
+        graph,
+        issue: 1,
+        data: join(at, 'data'),
+        meta: makeBenchMeta(set, input),
+        labels: makeArmRunLabels(input),
+        ...(options.provider && { choice: { provider: options.provider.name } }),
+      },
       undefined,
       keys
     );
@@ -704,7 +714,9 @@ const runArm = async (arm: string, caseDir: string, set: string, repo: string) =
   if (ended()) return;
   const missing = unpriced(arm, findCaseGraphDir(c));
   if (missing.length) throw new Error(`no list price for ${missing.join(', ')}: add it to infra/local/aliases.json`);
-  if (!keys.AGENTGRAPH_PROXY_KEYS) throw new Error('no model keys: pass --keys <env file>');
+  if (!options.provider && !keys.AGENTGRAPH_PROXY_KEYS)
+    throw new Error('no model keys: pass --keys <env file> or --provider <name>');
+  Object.assign(process.env, await options.provider?.settings?.());
   const log = logger(set, { case: c.id, arm, slot: basename(slot) });
   if (!claim(slot)) return log({ event: 'busy' });
   onStop(signal => {
@@ -719,7 +731,7 @@ const runArm = async (arm: string, caseDir: string, set: string, repo: string) =
       await waitWhileServicesDown(log, false, net =>
         down(net, { dir: work, eligible: readEnvRefs(work), ...(cache && { image: c.image }) })
       );
-      guard(set, false);
+      if (!options.provider) guard(set, false);
       const at = makeNextAttempt(slot);
       mkdirSync(at, { recursive: true });
       const started = Date.now();
@@ -1494,9 +1506,25 @@ export const unpriced = (arm: string, graph: string, point = options.point) => {
   return [...new Set(point ? [point.split(':')[1]!] : named)].filter(m => !isModelPriced(prices, m));
 };
 
-export const whyPointUnready = async (point: string) => {
-  const model = point.split(':')[1]!;
+export const readBenchProvider = async (name: string) => {
+  const { providers = [] } = await Effect.runPromise(
+    readHarnessSettings.pipe(
+      Effect.provideService(ConfigProvider.ConfigProvider, makeHarnessConfigProvider({ provider: name }))
+    )
+  );
+  const provider = providers.find(p => p.name === name)!;
+  if (!(await provider.ready({ image, sandbox: '' })))
+    throw new Error(
+      [`${name} is not ready; log in with agi in a repo first`, provider.setup].filter(Boolean).join('\n')
+    );
+  return provider;
+};
+
+export const whyPointUnready = async (point: string, provider?: Pick<Provider, 'name' | 'harnesses'>) => {
+  const [harness, model] = point.split(':') as [string, string];
   if (!isModelPriced(prices, model)) return `${point}: no list price for ${model}`;
+  if (provider)
+    return provider.harnesses.includes(harness) ? undefined : `${point}: ${provider.name} does not serve ${harness}`;
   const r = await ask(model, readPointKeys(point).spare, 'Reply with exactly: ok', 120_000).catch(
     (e: unknown) => e as Error
   );
@@ -1672,6 +1700,7 @@ if (import.meta.main) {
       graph: { type: 'string' },
       'drop-env': { type: 'boolean', default: false },
       label: { type: 'string', multiple: true },
+      provider: { type: 'string' },
     },
   });
   const [command, arm, caseDir, out] = positionals;
@@ -1685,6 +1714,7 @@ if (import.meta.main) {
   Object.assign(limits, { codex: Number(values['max-codex']), claude: Number(values['max-claude-calls']) });
   panel = parsePanel(values.judges);
   readBenchKeys(values.keys ?? join(agentgraphDir, 'infra/local/.keys.env'));
+  if (values.provider) options.provider = await readBenchProvider(values.provider);
   if (command !== 'judge' && !image.startsWith('sha256:'))
     process.env.AGENTGRAPH_IMAGE = image = imageId(image) ?? image;
   const set = out && resolve(out);

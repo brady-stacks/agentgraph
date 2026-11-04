@@ -3,7 +3,7 @@
  * disk; each gates its case on the reference runs, then runs, scores and judges its slot through bin/bench.ts.
  * Usage: node bench/start-runs.ts <set> [--cases a,b] [--arms v2,floor] [--points opencode:luna] [--repeats 3]
  *        [--graph dir] [--label key=value]... [--parallel 3] [--max-codex 90] [--cap usd --per usd --orenv file]
- *        [--keys file] [--judges opus:1,sonnet:2|none] [--repos dir] [--dry]
+ *        [--keys file | --provider name] [--judges opus:1,sonnet:2|none] [--repos dir] [--dry]
  * Exits 1 while runs are left, so a queue tries again later.
  */
 import { spawnSync } from 'node:child_process';
@@ -146,6 +146,7 @@ if (import.meta.main) {
       per: { type: 'string', default: '0.3' },
       orenv: { type: 'string' },
       keys: { type: 'string' },
+      provider: { type: 'string' },
       judges: { type: 'string', default: 'opus:1,sonnet:2' },
       repos: { type: 'string', default: join(homedir(), '.agentgraph/tune/repos') },
       dry: { type: 'boolean', default: false },
@@ -188,9 +189,10 @@ if (import.meta.main) {
   onStop(() => release(lock));
   try {
     bench.readBenchKeys(values.keys ?? join(import.meta.dirname, '../infra/local/.keys.env'));
-    const unready = (await Promise.all([...new Set(queue.map(u => u.point))].map(bench.whyPointUnready))).filter(
-      Boolean
-    );
+    const provider = values.provider ? await bench.readBenchProvider(values.provider) : undefined;
+    const unready = (
+      await Promise.all([...new Set(queue.map(u => u.point))].map(point => bench.whyPointUnready(point, provider)))
+    ).filter(Boolean);
     if (unready.length) throw new Error(`points not ready:\n${unready.join('\n')}`);
     const orKey = values.orenv
       ? readFileOrEmpty(values.orenv)
@@ -219,6 +221,7 @@ if (import.meta.main) {
       '--max-claude-calls',
       values['max-claude-calls'],
       ...(values.keys ? ['--keys', resolve(values.keys)] : []),
+      ...(values.provider ? ['--provider', values.provider] : []),
     ];
     const runOne = async (u: (typeof wanted)[number]) => {
       const name = `${u.c.id}-${u.arm}-${u.point.replace(':', '-')}-r${u.repeat}`;
