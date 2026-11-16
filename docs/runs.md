@@ -43,6 +43,7 @@ The first command creates this file. Unknown fields fail. `checkout`, `graph` an
 | Field | Default; purpose |
 | --- | --- |
 | `repo` | Empty; tracker repository |
+| `fork` | None; GitHub `owner/name` receiving work branches; issues stay in `repo` |
 | `checkout` | Checkout path; repository for base sync and branch exports |
 | `graph` | Checkout `.agentgraph/`; graph folder |
 | `env` | None; env file |
@@ -133,7 +134,7 @@ Readers derive `engine`, `image`, `config` and `harnesses` labels from `versions
 | `session` | End reason, resume status, dropped-resume reason, cost and `used` |
 | `setup` | `ms`, `exit` and `used` |
 | `env`, `cache` | Environment and cached files |
-| `applied` | Proposal with URL, failure reason or `skip` reason; skips do not fail tries |
+| `applied` | Proposal with `status`: `applied`, `refused` or `skipped`; refusals and skips carry a `reason`, and skips do not fail tries |
 | `outcome` | Pass, failure, back, ask, answer or stop; next state |
 | `saved` | Changes; removals in `cleared` |
 | `spoken` | Command or tracker event and its source |

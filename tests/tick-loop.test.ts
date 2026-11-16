@@ -56,7 +56,7 @@ describe('tick', () => {
       ...t,
       apply: (n: number, p: Proposal, work?: Parameters<typeof t.apply>[2]) =>
         p.kind === 'comment' || p.kind === 'ask' || p.kind === 'react'
-          ? Effect.succeed({ proposal: p, ok: true, skip: 'Fork mode keeps replies local.' })
+          ? Effect.succeed({ proposal: p, status: 'skipped' as const, reason: 'Fork mode keeps replies local.' })
           : t.apply(n, p, work),
     }));
     const [done] = await run(tick(small, 7).pipe(Effect.provideServiceEffect(Tracker, local)));
@@ -64,7 +64,7 @@ describe('tick', () => {
     expect(done?.eyes).toBeUndefined();
     expect(
       readTrace(where.data, done!.id).flatMap(line =>
-        'applied' in line && line.applied.skip ? [line.applied.proposal.kind] : []
+        'applied' in line && line.applied.status === 'skipped' ? [line.applied.proposal.kind] : []
       )
     ).toContain('comment');
   });

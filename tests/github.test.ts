@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash, generateKeyPairSync, verify } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -200,19 +201,19 @@ describe('githubTracker', () => {
     { kind: 'comment', body: 'Done' },
     { kind: 'ask', question: 'Which behavior?' },
     { kind: 'react' },
-  ] satisfies Proposal[])('records $kind as a counted local skip in fork mode', async proposal => {
+    { kind: 'label', add: ['agent:working'] },
+  ] satisfies Proposal[])('records $kind as skipped in fork mode', async proposal => {
     const f = fake({});
     const result = await run(
       f,
       Effect.flatMap(Tracker, t => t.apply(7, proposal)),
       'fork/r'
     );
-    expect(result).toMatchObject({ ok: true, proposal, skip: expect.stringContaining('local') });
+    expect(result).toMatchObject({ status: 'skipped', proposal, reason: expect.stringContaining('local') });
     expect(f.calls).toEqual([]);
   });
 
   it.each([
-    { kind: 'label', add: ['agent:working'] },
     { kind: 'merge', number: 8, head: 'abc' },
     { kind: 'issue', title: 'Follow-up', body: 'Details' },
   ] satisfies Proposal[])('refuses upstream $kind writes in fork mode', async proposal => {
@@ -222,7 +223,11 @@ describe('githubTracker', () => {
       Effect.flatMap(Tracker, t => t.apply(7, proposal)),
       'fork/r'
     );
-    expect(result).toMatchObject({ ok: false, proposal, reason: expect.stringContaining('only pull requests') });
+    expect(result).toMatchObject({
+      status: 'refused',
+      proposal,
+      reason: expect.stringContaining('only pull requests'),
+    });
     expect(f.calls).toEqual([]);
   });
 
@@ -237,14 +242,24 @@ describe('githubTracker', () => {
     expect(f.calls).toEqual([]);
   });
 
-  it('refreshes public upstream git without a token and authenticates only the fork installation', async () => {
+  it('authenticates both private upstream git and the fork installation', async () => {
     const setup = github.tracker!({ repo: app.repo, fork: 'fork/r', app: Option.some(app), studio: '' });
     expect(setup.origin).toMatchObject({
       origin: 'https://github.com/o/r.git',
       fork: { origin: 'https://github.com/fork/r.git' },
     });
-    expect(setup.origin.token).toBeUndefined();
+    expect(
+      await Effect.runPromise(
+        setup.origin.token!.pipe(
+          Effect.provideService(
+            ConfigProvider.ConfigProvider,
+            ConfigProvider.fromEnv({ env: { AGENTGRAPH_GITHUB_TOKEN: 'private-token' } })
+          )
+        )
+      )
+    ).toBe('private-token');
     expect(setup.origin.fork?.token).toBeDefined();
+    expect(setup.origin.fork?.pushToken).toBeDefined();
   });
 
   it('reads upstream issues and finds fork pull requests without treating foreign branches as ours', async () => {
@@ -299,7 +314,7 @@ describe('githubTracker', () => {
         ),
         'fork/r'
       );
-      expect(result).toMatchObject({ ok: true, url: 'https://github.com/o/r/pull/8' });
+      expect(result).toMatchObject({ status: 'applied', url: 'https://github.com/o/r/pull/8' });
       expect(f.calls.find(c => c.method === 'POST' && c.path.endsWith('/pulls'))!.body).toMatchObject({
         head: 'fork:agentgraph/7',
         head_repo: 'r',
@@ -394,6 +409,129 @@ describe('githubTracker', () => {
     expect(f.calls.some(c => c.path.includes('/pulls/8/commits'))).toBe(false);
   });
 
+  it('keeps cached user credentials isolated between fork setups', async () => {
+    const host = { repo: app.repo, fork: 'fork/r', app: Option.some(app), studio: '' };
+    const first = github.tracker!(host);
+    const second = github.tracker!(host);
+    const credential = (setup: typeof first, value: string) =>
+      Effect.runPromise(
+        setup.origin.token!.pipe(
+          Effect.provideService(
+            ConfigProvider.ConfigProvider,
+            ConfigProvider.fromEnv({ env: { AGENTGRAPH_GITHUB_TOKEN: value } })
+          )
+        )
+      );
+    expect(await credential(first, 'first-user')).toBe('first-user');
+    expect(await credential(second, 'second-user')).toBe('second-user');
+    expect(await credential(first, 'changed-user')).toBe('first-user');
+  });
+
+  it.each([403, 404])('keeps the fork activity stream untrusted when permission lookup returns %s', async status => {
+    const f = fake({
+      'GET /repos/fork/r/installation': { id: 10 },
+      'POST /app/installations/10/access_tokens': { token: 'fork-token', expires_at: '2999-01-01T00:00:00Z' },
+      'GET /repos/o/r/issues/comments': [comment(1, 'alice', 'OWNER', 'Still visible')],
+      'GET /repos/o/r/pulls/comments': [],
+      'GET /repos/o/r/issues/events': [
+        {
+          id: 3,
+          event: 'labeled',
+          actor: { login: 'alice' },
+          created_at: '2026-10-16T11:00:00Z',
+          label: { name: 'ready' },
+          issue: { number: 8 },
+        },
+      ],
+      'GET /repos/o/r/pulls': [
+        pull(8, { head: { ref: 'agentgraph/7', sha: 'fork-head', repo: { full_name: 'fork/r' } } }),
+        pull(9),
+      ],
+      'GET /repos/o/r/pulls/8/reviews': [],
+      'GET /repos/o/r/pulls/9/reviews': [],
+      'GET /repos/fork/r/activity': [
+        {
+          id: 2,
+          ref: 'refs/heads/agentgraph/7',
+          after: 'new-head',
+          pushed_at: '2026-10-16T12:00:00Z',
+          pusher: { login: 'alice' },
+        },
+      ],
+      'GET /repos/o/r/collaborators/alice/permission': () => ({ status }),
+    });
+    const events = await run(
+      f,
+      Effect.flatMap(Tracker, t => Stream.runCollect(t.since('2026-10-16T00:00:00Z'))),
+      'fork/r'
+    );
+    expect(events.map(e => [e.id, e.trusted])).toEqual([
+      ['comment-1', false],
+      ['event-3', false],
+      ['push-2', false],
+    ]);
+    expect(f.calls.some(c => /\/pulls\/\d+\/commits/.test(c.path))).toBe(false);
+  });
+
+  it.each([401, 422])('preserves non-permission lookup failures (%s)', async status => {
+    const f = fake({
+      'GET /repos/o/r/issues/comments': [comment(1, 'alice', 'OWNER', 'Context')],
+      'GET /repos/o/r/pulls/comments': [],
+      'GET /repos/o/r/issues/events': [],
+      'GET /repos/o/r/pulls': [],
+      'GET /repos/fork/r/installation': { id: 10 },
+      'POST /app/installations/10/access_tokens': { token: 'fork-token', expires_at: '2999-01-01T00:00:00Z' },
+      'GET /repos/fork/r/activity': [],
+      'GET /repos/o/r/collaborators/alice/permission': () => ({ status }),
+    });
+    const result = await run(
+      f,
+      Effect.flatMap(Tracker, t => Stream.runCollect(t.since('')).pipe(Effect.result)),
+      'fork/r'
+    );
+    expect(Result.isFailure(result) && result.failure).toMatchObject({ status });
+  });
+
+  it.each([
+    ['fork/r', ['Fix it', 'Bot fix']],
+    [
+      'other/r',
+      ['(commit title by @ana withheld: from a fork)', '(commit title by @helper[bot] withheld: from a fork)'],
+    ],
+  ] as const)('recognizes commit display ownership for %s without trusting authors', async (repository, titles) => {
+    const f = fake({
+      'GET /repos/o/r/issues/8': issue(8, { pull_request: {} }),
+      'GET /repos/o/r/pulls/8': pull(8, {
+        head: { ref: 'agentgraph/8', sha: 'head8', repo: { full_name: repository } },
+      }),
+      'GET /repos/o/r/issues/8/comments': [],
+      'GET /repos/o/r/pulls/8/comments': [],
+      'GET /repos/o/r/pulls/8/reviews': [],
+      'GET /repos/o/r/issues/8/events': [],
+      'GET /repos/o/r/pulls/8/commits': [
+        {
+          sha: 'a1',
+          author: { login: 'ana' },
+          commit: { message: 'Fix it', author: { date: '2026-10-16T10:00:00Z' } },
+        },
+        {
+          sha: 'a2',
+          author: { login: 'helper[bot]' },
+          commit: { message: 'Bot fix', author: { date: '2026-10-16T10:00:00Z' } },
+        },
+      ],
+      'GET /repos/o/r/collaborators/ana/permission': { permission: 'write' },
+    });
+    const result = await run(
+      f,
+      Effect.flatMap(Tracker, t => t.issue(8)),
+      'fork/r'
+    );
+    const commits = result.events.filter(e => e.kind === 'commit');
+    expect(commits.map(e => e.commit?.title)).toEqual(titles);
+    expect(commits.map(e => e.trusted)).toEqual([false, false]);
+  });
+
   it('refuses a cross-fork stack whose base is a work branch', async () => {
     const f = fake({});
     const result = await run(
@@ -410,7 +548,7 @@ describe('githubTracker', () => {
       'fork/r'
     );
     expect(result).toMatchObject({
-      ok: false,
+      status: 'refused',
       reason: 'cross-fork stacked pull requests need a base branch in upstream',
     });
     expect(f.calls).toEqual([]);
@@ -1484,7 +1622,7 @@ describe('githubTracker', () => {
         );
       })
     );
-    expect(applied.map(a => [a.ok, a.url])).toEqual([
+    expect(applied.map(a => [a.status === 'applied', a.status !== 'skipped' ? a.url : undefined])).toEqual([
       [true, 'https://github.com/o/r/issues/7#c1'],
       [true, undefined],
       [true, 'https://github.com/o/r/pull/9'],
@@ -1501,7 +1639,7 @@ describe('githubTracker', () => {
       ['POST', '/repos/o/r/issues', { title: 'Follow up', body: 'later', labels: ['size/M'] }],
       ['POST', '/repos/o/r/issues/7/sub_issues', { sub_issue_id: 555 }],
     ]);
-    expect(applied[3]!.id).toBe('10');
+    expect(applied[3]).toMatchObject({ status: 'applied', id: '10' });
     const minted = f.calls.filter(c => c.path.endsWith('/access_tokens')).map(c => c.body);
     expect(minted).toContainEqual({ permissions: { issues: 'write' }, repositories: ['r'] });
   });
@@ -1522,7 +1660,7 @@ describe('githubTracker', () => {
         })
       )
     );
-    expect(result).toMatchObject({ ok: true, id: '10' });
+    expect(result).toMatchObject({ status: 'applied', id: '10' });
     expect(f.calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/issues')?.body).toEqual({
       title: 'Work',
       body: 'Ready',
@@ -1561,7 +1699,7 @@ describe('githubTracker', () => {
       )
     );
     expect(applied).toMatchObject({
-      ok: true,
+      status: 'applied',
       id: '10',
       url: 'https://github.com/o/r/issues/10',
       reason: expect.stringMatching(/link.*422/),
@@ -1588,7 +1726,7 @@ describe('githubTracker', () => {
         ([n, p]) => Effect.flatMap(Tracker, tracker => tracker.apply(n, p))
       )
     );
-    expect(applied.map(a => [a.ok, a.id])).toEqual([
+    expect(applied.map(a => [a.status === 'applied', a.status === 'applied' ? a.id : undefined])).toEqual([
       [true, '12'],
       [true, '21'],
       [true, '22'],
@@ -1656,7 +1794,7 @@ describe('githubTracker', () => {
         Effect.flatMap(Tracker, tracker => tracker.findPost(n, p, operation))
       );
     const comment: Proposal = { kind: 'comment', body: 'Done.' };
-    expect(await find(7, comment, 'aa')).toMatchObject({ ok: true, id: '31', url: 'u31' });
+    expect(await find(7, comment, 'aa')).toMatchObject({ status: 'applied', id: '31', url: 'u31' });
     expect(await find(7, comment, 'a')).toBeUndefined();
     expect(await find(8, { ...comment, under: '5' }, 'bb')).toMatchObject({ id: '32', url: 'u32' });
     expect(await find(7, { kind: 'issue', title: 'Part', body: 'Done.' }, 'cc')).toMatchObject({
@@ -1744,7 +1882,7 @@ describe('githubTracker', () => {
 
     it('registers the chain of pull requests below a new one as a GitHub stack, bottom first', async () => {
       const f = fake({ ...chained, 'POST /repos/o/r/stacks': { status: 201, body: { number: 14 } } });
-      expect(await open(f)).toMatchObject({ ok: true, url: 'https://github.com/o/r/pull/12' });
+      expect(await open(f)).toMatchObject({ status: 'applied', url: 'https://github.com/o/r/pull/12' });
       expect(stackCalls(f)).toEqual([['POST', '/repos/o/r/stacks', { pull_requests: [10, 11, 12] }]]);
       const call = f.calls.find(c => c.path === '/repos/o/r/stacks')!;
       expect(call.headers.get('x-github-api-version')).toBe('2026-03-10');
@@ -1757,7 +1895,7 @@ describe('githubTracker', () => {
         'GET /repos/o/r/stacks?pull_request=11': [{ number: 14 }],
         'POST /repos/o/r/stacks/14/add': {},
       });
-      expect(await open(f)).toMatchObject({ ok: true });
+      expect(await open(f)).toMatchObject({ status: 'applied' });
       expect(stackCalls(f).at(-1)).toEqual(['POST', '/repos/o/r/stacks/14/add', { pull_requests: [12] }]);
     });
 
@@ -1770,7 +1908,7 @@ describe('githubTracker', () => {
         ],
         'PATCH /repos/o/r/pulls/12': { number: 12, html_url: 'https://github.com/o/r/pull/12' },
       });
-      expect(await open(f)).toMatchObject({ ok: true, url: 'https://github.com/o/r/pull/12' });
+      expect(await open(f)).toMatchObject({ status: 'applied', url: 'https://github.com/o/r/pull/12' });
       const patch = f.calls.find(c => c.method === 'PATCH')!;
       expect(patch.body).toEqual({
         title: 'T',
@@ -1780,7 +1918,7 @@ describe('githubTracker', () => {
 
     it('keeps the plain chain when the repo has no stacks', async () => {
       const f = fake(chained);
-      expect(await open(f)).toMatchObject({ ok: true, url: 'https://github.com/o/r/pull/12' });
+      expect(await open(f)).toMatchObject({ status: 'applied', url: 'https://github.com/o/r/pull/12' });
       expect(stackCalls(f)).toEqual([['POST', '/repos/o/r/stacks', { pull_requests: [10, 11, 12] }]]);
     });
   });
@@ -1832,8 +1970,8 @@ describe('githubTracker', () => {
       f,
       Effect.flatMap(Tracker, tracker => tracker.apply(8, { kind: 'merge', number: 8, head: 'stale' }))
     );
-    expect(merged.ok).toBe(false);
-    expect(merged.reason).toMatch(/409/);
+    expect(merged.status === 'applied').toBe(false);
+    expect(merged.status !== 'applied' ? merged.reason : undefined).toMatch(/409/);
     expect(f.calls.at(-1)!.body).toEqual({ sha: 'stale' });
     const failed = await run(
       f,
@@ -2018,8 +2156,8 @@ describe('githubTracker', () => {
         ),
         'fork/r'
       );
-      expect(results.map(r => r.ok)).toEqual([true, true]);
-      expect(results.map(r => r.url)).toEqual([
+      expect(results.map(r => r.status === 'applied')).toEqual([true, true]);
+      expect(results.map(r => (r.status !== 'skipped' ? r.url : undefined))).toEqual([
         `https://github.com/fork/r/commit/${head}`,
         `https://github.com/fork/r/commit/${f.remote(['rev-parse', 'agentgraph/7'])}`,
       ]);
@@ -2044,7 +2182,7 @@ describe('githubTracker', () => {
       expect(commit).toEqual({ message: 'Fix the typo', tree: git('write-tree'), parents: [base] });
       const head = f.calls.find(c => c.path === '/repos/o/r/git/refs')!.body!;
       expect(head.ref).toBe('refs/heads/agentgraph/7');
-      expect(applied).toMatchObject({ ok: true, held: [], url: `https://github.com/o/r/commit/${head.sha}` });
+      expect(applied).toMatchObject({ status: 'applied', held: [], url: `https://github.com/o/r/commit/${head.sha}` });
       expect(f.calls.filter(c => c.path === '/repos/o/r/git/blobs')).toHaveLength(2);
     });
 
@@ -2062,12 +2200,15 @@ describe('githubTracker', () => {
           return [first, yield* push('Second')] as const;
         })
       );
-      expect([first.ok, second.ok]).toEqual([true, true]);
+      expect([first.status === 'applied', second.status === 'applied']).toEqual([true, true]);
       const [one, two] = f.calls.filter(c => c.path === '/repos/o/r/git/commits').map(c => c.body);
       expect(one?.parents).toEqual([base]);
-      expect(two?.parents).toEqual([first.url!.split('/').at(-1)]);
+      expect(two?.parents).toEqual([(first.status !== 'skipped' ? first.url : undefined)!.split('/').at(-1)]);
       const patch = f.calls.find(c => c.method === 'PATCH')!.body;
-      expect(patch).toEqual({ sha: second.url!.split('/').at(-1), force: false });
+      expect(patch).toEqual({
+        sha: (second.status !== 'skipped' ? second.url : undefined)!.split('/').at(-1),
+        force: false,
+      });
     });
 
     it.each(['push', 'rebase'])('atomically refuses a late human push during a forced %s', async kind => {
@@ -2117,7 +2258,7 @@ describe('githubTracker', () => {
         f,
         Effect.flatMap(Tracker, tracker => tracker.apply(7, proposal, work))
       );
-      expect(applied).toMatchObject({ ok: false, reason: expect.stringMatching(/moved/) });
+      expect(applied).toMatchObject({ status: 'refused', reason: expect.stringMatching(/moved/) });
       expect(f.remote(['rev-parse', 'refs/heads/agentgraph/7'])).toBe(human);
       expect(f.calls.filter(c => c.method === 'PATCH' && c.body?.force)).toEqual([]);
     });
@@ -2140,7 +2281,7 @@ describe('githubTracker', () => {
           tracker.apply(7, { kind: 'push', branch: 'agentgraph/7', message: 'Rewrite', onto: base }, work)
         )
       );
-      expect(applied).toMatchObject({ ok: false, moved: true, reason: expect.stringMatching(/moved/) });
+      expect(applied).toMatchObject({ status: 'refused', moved: true, reason: expect.stringMatching(/moved/) });
       expect(f.calls.filter(c => c.method === 'PATCH')).toEqual([]);
     });
 
@@ -2150,7 +2291,7 @@ describe('githubTracker', () => {
       const f = dataApi(work, { 'GET /repos/o/r/git/ref/heads/agentgraph/7': { object: { sha: 'elsewhere' } } });
       const applied = await pushTo(f, work);
       expect(applied).toMatchObject({
-        ok: false,
+        status: 'refused',
         moved: true,
         reason: expect.stringMatching(/agentgraph\/7 is at elsewhere/),
       });
@@ -2177,11 +2318,11 @@ describe('githubTracker', () => {
           tracker.apply(9, { kind: 'rebase', branch: 'agentgraph/9', from: base, onto }, work)
         )
       );
-      expect(applied.ok).toBe(true);
+      expect(applied.status === 'applied').toBe(true);
       const commit = f.calls.find(c => c.path === '/repos/o/r/git/commits')!.body!;
       expect(commit).toMatchObject({ message: 'Child', parents: [onto] });
       expect(git('ls-tree', '--name-only', commit.tree!)).toBe('a.txt\nb.txt\nc.txt');
-      const head = applied.url!.split('/').at(-1);
+      const head = (applied.status !== 'skipped' ? applied.url : undefined)!.split('/').at(-1);
       expect(f.calls.find(c => c.path === '/graphql')!.body?.variables?.input.refUpdates[0]).toEqual({
         name: 'refs/heads/agentgraph/9',
         beforeOid: tip,
@@ -2221,7 +2362,7 @@ describe('githubTracker', () => {
           tracker.apply(7, { kind: 'rebase', branch: 'agentgraph/7', from: base, onto }, work)
         )
       );
-      expect(applied).toMatchObject({ ok: false, reason: expect.stringMatching(/merge commit/) });
+      expect(applied).toMatchObject({ status: 'refused', reason: expect.stringMatching(/merge commit/) });
       expect(writes(f)).toEqual([]);
     });
 
@@ -2257,7 +2398,7 @@ describe('githubTracker', () => {
           )
         )
       );
-      expect(applied.ok).toBe(!conflict);
+      expect(applied.status === 'applied').toBe(!conflict);
       expect(writes(f)).toEqual([]);
       if (conflict) {
         expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toMatch(/<<<<<<<[\s\S]*upstream[\s\S]*pending/);
@@ -2266,7 +2407,7 @@ describe('githubTracker', () => {
         expect(readFileSync(join(dir, 'b.txt'), 'utf8')).toBe('pending\n');
         expect(readFileSync(join(dir, 'c.txt'), 'utf8')).toBe('upstream\n');
       }
-      expect((await pushTo(f, work)).ok).toBe(true);
+      expect((await pushTo(f, work)).status === 'applied').toBe(true);
       expect(f.calls.find(c => c.path === '/repos/o/r/git/commits')!.body?.parents).toEqual([onto]);
     });
 
@@ -2275,9 +2416,9 @@ describe('githubTracker', () => {
       writeFileSync(join(dir, 'a.txt'), 'two\n');
       const f = dataApi(work);
       const escaped = await pushTo(f, work, 'agentgraph/../main');
-      expect(escaped).toMatchObject({ ok: false, reason: 'invalid branch "agentgraph/../main"' });
+      expect(escaped).toMatchObject({ status: 'refused', reason: 'invalid branch "agentgraph/../main"' });
       const main = await pushTo(f, work, 'main');
-      expect(main).toMatchObject({ ok: false, reason: 'a push goes to a agentgraph/ branch' });
+      expect(main).toMatchObject({ status: 'refused', reason: 'a push goes to a agentgraph/ branch' });
       expect(f.calls.some(c => c.path.includes('/git/'))).toBe(false);
     });
 
@@ -2302,7 +2443,7 @@ describe('githubTracker', () => {
       writeFileSync(join(dir, '.gitattributes'), '* filter=evil\n');
       writeFileSync(join(dir, 'a.txt'), 'two\n');
       const applied = await pushTo(dataApi(work), work);
-      expect(applied.ok).toBe(true);
+      expect(applied.status === 'applied').toBe(true);
       expect(existsSync(marker)).toBe(false);
     });
 
@@ -2339,7 +2480,7 @@ describe('githubTracker', () => {
           ])
         )
       );
-      expect([pushed.ok, opened.ok]).toEqual([false, true]);
+      expect([pushed.status === 'applied', opened.status === 'applied']).toEqual([false, true]);
       expect(pushed).toMatchObject({
         held: ['.github/workflows/x.yml'],
         url: expect.stringContaining('/commit/'),
@@ -2368,11 +2509,16 @@ describe('githubTracker', () => {
           })
         )
       );
-      expect(results.map(r => r.ok)).toEqual([false, true, true]);
-      expect(results.map(r => r.held)).toEqual(Array.from({ length: 3 }, () => ['.github/workflows/x.yml']));
-      expect(results[1]!.url).toContain('/commit/');
-      expect(results[2]!.url).toBeUndefined();
-      expect(results.slice(1).map(r => r.reason)).toEqual([undefined, undefined]);
+      expect(results.map(r => r.status === 'applied')).toEqual([false, true, true]);
+      expect(results.map(r => (r.status !== 'skipped' ? r.held : undefined))).toEqual(
+        Array.from({ length: 3 }, () => ['.github/workflows/x.yml'])
+      );
+      expect(results[1]!.status !== 'skipped' ? results[1]!.url : undefined).toContain('/commit/');
+      expect(results[2]!.status !== 'skipped' ? results[2]!.url : undefined).toBeUndefined();
+      expect(results.slice(1).map(r => (r.status !== 'applied' ? r.reason : undefined))).toEqual([
+        undefined,
+        undefined,
+      ]);
       expect(f.remote(['show', 'agentgraph/7:a.txt'])).toBe('three');
       expect(f.calls.filter(c => c.path === '/repos/o/r/git/commits')).toHaveLength(2);
     });
@@ -2392,13 +2538,14 @@ describe('githubTracker', () => {
           })
         )
       );
-      expect(first).toMatchObject({ ok: true, held: [] });
+      expect(first).toMatchObject({ status: 'applied', held: [] });
       expect(second).toMatchObject({
-        ok: false,
+        status: 'refused',
         held: ['.github/workflows/x.yml'],
         reason: expect.stringContaining('Nothing pushed'),
       });
-      expect(second!.url).toBeUndefined();
+      expect(second).not.toHaveProperty('url');
+      assert(first?.status === 'applied');
       expect(f.calls.filter(c => c.path === '/repos/o/r/git/commits')).toHaveLength(1);
       expect(f.remote(['rev-parse', 'refs/heads/agentgraph/7'])).toBe(first!.url!.split('/').at(-1));
     });
@@ -2410,11 +2557,11 @@ describe('githubTracker', () => {
       if (existing) f.remote(['update-ref', 'refs/heads/agentgraph/7', base]);
       const applied = await pushTo(f, work);
       expect(applied).toMatchObject({
-        ok: false,
+        status: 'refused',
         held: ['.github/workflows/x.yml'],
         reason: expect.stringContaining('Nothing pushed'),
       });
-      expect(applied.url).toBeUndefined();
+      expect(applied.status !== 'skipped' ? applied.url : undefined).toBeUndefined();
       expect(writes(f)).toEqual([]);
       expect(readFileSync(join(dir, '.github/workflows/x.yml'), 'utf8')).toBe('on: push\n');
     });
@@ -2424,7 +2571,7 @@ describe('githubTracker', () => {
       for (let i = 0; i < 250; i++) writeFileSync(join(dir, `f${i}`), `${i}\n`);
       writeFileSync(join(dir, 'big'), Buffer.alloc(1_500_000, 1));
       const f = dataApi(work);
-      expect(await pushTo(f, work)).toMatchObject({ ok: true });
+      expect(await pushTo(f, work)).toMatchObject({ status: 'applied' });
       expect(f.calls.filter(c => c.path === '/repos/o/r/git/blobs')).toHaveLength(251);
     });
 
@@ -2432,7 +2579,10 @@ describe('githubTracker', () => {
       const { dir, work } = repo();
       writeFileSync(join(dir, 'big'), 'big\n');
       const f = dataApi(work, { 'POST /repos/o/r/git/blobs': () => ({ status: 422, body: { message: 'too large' } }) });
-      expect(await pushTo(f, work)).toMatchObject({ ok: false, reason: expect.stringMatching(/^big: GitHub POST/) });
+      expect(await pushTo(f, work)).toMatchObject({
+        status: 'refused',
+        reason: expect.stringMatching(/^big: GitHub POST/),
+      });
     });
 
     it.each([
@@ -2443,7 +2593,7 @@ describe('githubTracker', () => {
       change(dir);
       const f = dataApi(work);
       const applied = await pushTo(f, work);
-      expect(applied).toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
+      expect(applied).toMatchObject({ status: 'refused', reason: expect.stringMatching(reason) });
       expect(writes(f)).toEqual([]);
     });
   });

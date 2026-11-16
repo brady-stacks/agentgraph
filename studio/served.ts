@@ -19,6 +19,7 @@ export type ServedGraph = {
   data?: string;
   files: string[];
   local: boolean;
+  fork?: string;
   graph?: Graph;
   host?: ReturnType<typeof EngineModule.makeInstanceHost>;
   problems: Problem[];
@@ -91,7 +92,17 @@ const readInstanceServed = async ({ root, graph: explicit }: StudioInstances, na
       layer: setup.layer(loaded.graph?.trust ?? current.trust, instance.owner),
       origin: setup.origin,
     });
-    return { name, title: name, dir, data: instance.data, files, local: !!setup.origin.local, host, ...loaded };
+    return {
+      name,
+      title: name,
+      dir,
+      data: instance.data,
+      files,
+      local: !!setup.origin.local,
+      ...(current.fork && { fork: current.fork }),
+      host,
+      ...loaded,
+    };
   } catch (e) {
     const problems = [{ path: 'instance.yaml', message: (e as Error).message }];
     return {
@@ -128,7 +139,13 @@ const readPlainServed = async (): Promise<ServedGraph> => {
     config && existsSync(config) ? { AGENTGRAPH_CONFIG: config } : {}
   );
   const loaded = await loadGraph(dir, undefined, scope);
-  return { ...plain, dir, ...(await makeHost(loaded.graph)), ...loaded };
+  return {
+    ...plain,
+    dir,
+    ...(scope.env.AGENTGRAPH_FORK && { fork: scope.env.AGENTGRAPH_FORK }),
+    ...(await makeHost(loaded.graph)),
+    ...loaded,
+  };
 };
 
 const readServedGraphs = async (): Promise<ServedGraph[]> => {

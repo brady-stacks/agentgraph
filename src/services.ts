@@ -25,6 +25,7 @@ import { Runner, SandboxError } from './sandbox.ts';
 import { priceTable } from './prices.ts';
 import { checkLogs, fileStore } from './store.ts';
 import type { Services } from './run/execute.ts';
+import { GitHubRepository } from './settings.ts';
 
 export type Settings = {
   repo: string;
@@ -111,10 +112,11 @@ export const readHostSettings = async (flags: Partial<Record<'data' | 'tracker',
 
 export const settings = Config.all({
   ...hostSettings,
-  repo: Config.String('AGENTGRAPH_REPO'),
-  fork: Config.option(
-    Config.schema(Schema.String.check(Schema.isPattern(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/)), 'AGENTGRAPH_FORK')
-  ).pipe(Config.map(Option.getOrUndefined)),
+  repo: Config.schema(
+    Schema.String.check(Schema.makeFilter(value => value === '' || Schema.is(GitHubRepository)(value))),
+    'AGENTGRAPH_REPO'
+  ),
+  fork: Config.option(Config.schema(GitHubRepository, 'AGENTGRAPH_FORK')).pipe(Config.map(Option.getOrUndefined)),
   graph: Config.String('AGENTGRAPH_DIR').pipe(Config.withDefault('.agentgraph')),
   proxy: Config.all({
     url: proxyUrl,

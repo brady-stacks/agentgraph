@@ -6,7 +6,7 @@ import { Effect, Layer, Semaphore, Stream } from 'effect';
 import { findDeadCheckouts, getCachePath, getCheckoutPaths, removeCheckout, writeCheckoutOwner } from './env.ts';
 import { removeBranch } from './disk.ts';
 import { commitCheckout, commitCheckoutOnce, hostGit, readGit, readBranches, readWorktreeAdmin } from './git.ts';
-import type { TrackerSetup } from './tracker.ts';
+import { branchPrefix, forkRefPrefix, isAgentBranch, type TrackerSetup } from './tracker.ts';
 import { type Box, Runner, Sandbox, SandboxError } from './sandbox.ts';
 import { type Checkout, type Command, type Exit } from './types.ts';
 
@@ -75,7 +75,7 @@ export const makeSandbox = (
               '--update-head-ok',
               'origin',
               ...fetched,
-              ...(o.fork ? ['^refs/heads/agentgraph/*'] : []),
+              ...(o.fork ? [`^refs/heads/${branchPrefix}*`] : []),
             ],
             env
           );
@@ -87,8 +87,8 @@ export const makeSandbox = (
                 '--prune',
                 '--update-head-ok',
                 o.fork.origin,
-                '+refs/heads/agentgraph/*:refs/heads/agentgraph/*',
-                '+refs/heads/*:refs/remotes/fork/*',
+                `+refs/heads/${branchPrefix}*:refs/heads/${branchPrefix}*`,
+                `+refs/heads/*:${forkRefPrefix}*`,
               ],
               forkEnv
             );
@@ -241,11 +241,19 @@ export const makeSandbox = (
 
       return {
         readBranches: () =>
-          readBranches(mirror, o.local ? undefined : '%(if)%(worktreepath)%(then)%(refname:strip=2)%(end)'),
+          readBranches(mirror, o.local || o.fork ? undefined : '%(if)%(worktreepath)%(then)%(refname:strip=2)%(end)'),
         readHead,
         removeBranch: (branch, base, head) =>
           lock.withPermits(1)(
-            removeBranch(mirror, branch, o.local && base === 'origin/HEAD' ? 'HEAD' : base, head, o.data)
+            Effect.gen(function* () {
+              const ref = `refs/heads/${branch}`;
+              const before = yield* verify(ref);
+              yield* removeBranch(mirror, branch, o.local && base === 'origin/HEAD' ? 'HEAD' : base, head, o.data);
+              if (!o.fork || !isAgentBranch(branch) || !head || before !== head || (yield* verify(ref))) return;
+              const env = o.fork.pushToken ? auth(yield* Effect.mapError(o.fork.pushToken, e => infra(e.message))) : {};
+              yield* inMirror(['push', `--force-with-lease=${ref}:${head}`, o.fork.origin, `:${ref}`], env);
+              yield* inMirror(['update-ref', '-d', `${forkRefPrefix}${branch}`, head]);
+            })
           ),
         checkout,
         lines,

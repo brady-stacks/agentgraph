@@ -41,25 +41,39 @@ it.each(['fork/project', 'organization/project-fork'])(
     });
     expect(value.repo).toBe('upstream/project');
     expect(setup.origin.origin).toBe('https://github.com/upstream/project.git');
-    expect(setup.origin.token).toBeUndefined();
+    expect(
+      await Effect.runPromise(
+        setup.origin.token!.pipe(
+          Effect.provideService(
+            ConfigProvider.ConfigProvider,
+            ConfigProvider.fromEnv({ env: { AGENTGRAPH_GITHUB_TOKEN: 'upstream-token' } })
+          )
+        )
+      )
+    ).toBe('upstream-token');
     expect(setup.origin.fork?.origin).toBe(`https://github.com/${fork}.git`);
   }
 );
 
-it.each([' ', 'fork', 'fork/project/extra', 'https://github.com/fork/project'])(
-  'rejects malformed fork configuration %j',
-  async fork => {
-    const result = await Effect.runPromise(
-      Effect.result(settings).pipe(
-        Effect.provideService(
-          ConfigProvider.ConfigProvider,
-          ConfigProvider.fromEnv({ env: { AGENTGRAPH_REPO: 'upstream/project', AGENTGRAPH_FORK: fork } })
+it.each(['AGENTGRAPH_REPO', 'AGENTGRAPH_FORK'])('validates %s as an owner/name repository', async name => {
+  const malformed = [' ', 'fork', 'fork/project/extra', 'https://github.com/fork/project'];
+  const results = await Promise.all(
+    malformed.map(value =>
+      Effect.runPromise(
+        Effect.result(settings).pipe(
+          Effect.provideService(
+            ConfigProvider.ConfigProvider,
+            ConfigProvider.fromEnv({ env: { AGENTGRAPH_REPO: 'upstream/project', [name]: value } })
+          )
         )
       )
-    );
-    expect(Result.isFailure(result)).toBe(true);
-  }
-);
+    )
+  );
+  expect(results.map(Result.isFailure)).toEqual(malformed.map(() => true));
+  expect(results.map(result => String(Result.getFailure(result)))).toEqual(
+    malformed.map(() => expect.stringContaining(name))
+  );
+});
 
 it.each(['AGENTGRAPH_TOOL_SECRET', 'AGENTGRAPH_APP_KEY', 'GH_TOKEN', 'PLUGIN_PASSWORD', 'UNREVIEWED_VALUE'])(
   'refuses forwarding %s to sessions',

@@ -28,7 +28,7 @@ it('serves each named instance under its own name, with no run crossing over', a
   for (const i of [live!, bench!]) {
     writeFileSync(
       join(i.dir, 'instance.yaml'),
-      `checkout: ${seed}\nbase: main\nowner: o\nexported: {}\ngraph: ${starter}\n`
+      `checkout: ${seed}\nbase: main\nowner: o\nexported: {}\ngraph: ${starter}\nfork: ${i === live ? 'live' : 'bench'}/project\n`
     );
     writeRun(i.data, `run-${i.dir.split('/').at(-1)}`);
   }
@@ -62,6 +62,8 @@ it('serves each named instance under its own name, with no run crossing over', a
     expect(await listed('live')).toEqual(['live/issue run-live']);
     expect(await listed('bench')).toEqual(['bench/issue run-bench']);
     expect(await opened('?instance=bench', 'run-bench')).toMatchObject({ instance: 'bench' });
+    expect(await opened('?instance=live', 'run-live')).toMatchObject({ fork: 'live/project', repo: '' });
+    expect(await runs('?instance=bench')).toMatchObject([{ fork: 'bench/project', repo: '' }]);
     expect(await opened('?instance=live', 'run-bench')).toBeNull();
     const tail = (after: { trace: number; checks: number }) =>
       runStudioAction(`${base}/api/actions?instance=live`, actions => actions.run({ id: 'run-live', after }));
@@ -131,6 +133,7 @@ it('ignores instance settings from the shell when it serves several instances, a
   }
   vi.stubEnv('AGI_STUDIO_INSTANCES', JSON.stringify({ root, names: ['left', 'right'] }));
   vi.stubEnv('AGENTGRAPH_TRACKER', 'github');
+  vi.stubEnv('AGENTGRAPH_FORK', 'shell/project');
   const warned = vi.spyOn(console, 'error').mockImplementation(() => {});
   try {
     const served = await makeServedGraphs().read();
@@ -138,7 +141,9 @@ it('ignores instance settings from the shell when it serves several instances, a
       { name: 'left', local: true, problems: [] },
       { name: 'right', local: true, problems: [] },
     ]);
-    expect(warned).toHaveBeenCalledWith(expect.stringContaining('ignoring AGENTGRAPH_TRACKER from the shell'));
+    expect(served.map(instance => instance.fork)).toEqual([undefined, undefined]);
+    expect(warned).toHaveBeenCalledWith(expect.stringContaining('AGENTGRAPH_TRACKER'));
+    expect(warned).toHaveBeenCalledWith(expect.stringContaining('AGENTGRAPH_FORK'));
   } finally {
     warned.mockRestore();
     vi.unstubAllEnvs();
