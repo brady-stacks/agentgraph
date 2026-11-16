@@ -360,37 +360,51 @@ describe('githubTracker', () => {
       'GET /repos/o/r/issues/events': [],
       'GET /repos/o/r/pulls': [pull(8, { head: { ref: 'agentgraph/7', sha: 'head', repo: { full_name: 'fork/r' } } })],
       'GET /repos/o/r/pulls/8/reviews': [],
-      'GET /repos/fork/r/activity': [
-        {
-          id: 1,
-          ref: 'refs/heads/agentgraph/7',
-          after: 'one',
-          pushed_at: '2026-10-16T12:00:00Z',
-          pusher: { login: 'bob' },
-        },
-        {
-          id: 2,
-          ref: 'refs/heads/agentgraph/7',
-          after: 'two',
-          pushed_at: '2026-10-16T12:01:00Z',
-          pusher: { login: 'mallory' },
-        },
-        {
-          id: 3,
-          ref: 'refs/heads/agentgraph/7',
-          after: 'bot',
-          pushed_at: '2026-10-16T12:02:00Z',
-          pusher: { login: 'helper[bot]', type: 'Bot' },
-        },
-        { id: 4, ref: 'refs/heads/other', after: 'other', pushed_at: '2026-10-16T12:03:00Z', pusher: { login: 'bob' } },
-        {
-          id: 5,
-          ref: 'refs/heads/agentgraph/7',
-          after: 'old',
-          pushed_at: '2026-10-15T12:00:00Z',
-          pusher: { login: 'bob' },
-        },
-      ],
+      'GET /repos/fork/r/activity': () => ({
+        body: [
+          {
+            id: 4,
+            ref: 'refs/heads/other',
+            after: 'other',
+            timestamp: '2026-10-16T12:03:00Z',
+            actor: { login: 'bob' },
+          },
+          {
+            id: 3,
+            ref: 'refs/heads/agentgraph/7',
+            after: 'bot',
+            timestamp: '2026-10-16T12:02:00Z',
+            actor: { login: 'helper[bot]', type: 'Bot' },
+          },
+          {
+            id: 2,
+            ref: 'refs/heads/agentgraph/7',
+            after: 'two',
+            timestamp: '2026-10-16T12:01:00Z',
+            actor: { login: 'mallory' },
+          },
+        ],
+        headers: { link: '<https://api.github.com/repos/fork/r/activity?page=2>; rel="next"' },
+      }),
+      'GET /repos/fork/r/activity?page=2': () => ({
+        body: [
+          {
+            id: 1,
+            ref: 'refs/heads/agentgraph/7',
+            after: 'one',
+            timestamp: '2026-10-16T12:00:00Z',
+            actor: { login: 'bob' },
+          },
+          {
+            id: 5,
+            ref: 'refs/heads/agentgraph/7',
+            after: 'old',
+            timestamp: '2026-10-15T12:00:00Z',
+            actor: { login: 'bob' },
+          },
+        ],
+        headers: { link: '<https://api.github.com/repos/fork/r/activity?page=3>; rel="next"' },
+      }),
       'GET /repos/o/r/collaborators/bob/permission': { permission: 'write' },
       'GET /repos/o/r/collaborators/mallory/permission': { permission: 'read' },
     });
@@ -399,14 +413,15 @@ describe('githubTracker', () => {
       Effect.flatMap(Tracker, t => Stream.runCollect(t.since('2026-10-16T00:00:00Z'))),
       'fork/r'
     );
-    expect(events.map(e => [e.id, e.bot, e.issue, e.actor, e.trusted, e.commit?.sha])).toEqual([
-      ['push-1', false, 8, 'bob', true, 'one'],
-      ['push-2', false, 8, 'mallory', false, 'two'],
+    expect(events.map(e => [e.id, e.bot, e.issue, e.actor, e.trusted, e.commit?.sha, e.at])).toEqual([
+      ['push-1', false, 8, 'bob', true, 'one', '2026-10-16T12:00:00Z'],
+      ['push-2', false, 8, 'mallory', false, 'two', '2026-10-16T12:01:00Z'],
     ]);
     expect(f.calls.find(c => c.path.startsWith('/repos/fork/r/activity'))?.headers.get('authorization')).toBe(
       'Bearer fork-token'
     );
     expect(f.calls.some(c => c.path.includes('/pulls/8/commits'))).toBe(false);
+    expect(f.calls.some(c => c.path === '/repos/fork/r/activity?page=3')).toBe(false);
   });
 
   it('keeps cached user credentials isolated between fork setups', async () => {
@@ -454,8 +469,8 @@ describe('githubTracker', () => {
           id: 2,
           ref: 'refs/heads/agentgraph/7',
           after: 'new-head',
-          pushed_at: '2026-10-16T12:00:00Z',
-          pusher: { login: 'alice' },
+          timestamp: '2026-10-16T12:00:00Z',
+          actor: { login: 'alice' },
         },
       ],
       'GET /repos/o/r/collaborators/alice/permission': () => ({ status }),

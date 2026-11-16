@@ -435,14 +435,14 @@ export const githubTracker = (
     );
   const pollPushes = (open: RestPull[], cursor: string) =>
     Effect.gen(function* () {
-      const activities = yield* all<{ id: number; ref: string; after: string; pushed_at: string; pusher: User }>(
+      const activities = yield* all<{ id: number; ref: string; after: string; timestamp: string; actor: User }>(
         branches,
         `${branches.path}/activity?direction=desc&per_page=100`,
-        page => (page.at(-1)?.pushed_at ?? '') > cursor
+        page => (page.at(-1)?.timestamp ?? '') > cursor
       );
       const found: Event[] = [];
       for (const activity of activities) {
-        if (activity.pushed_at <= cursor || isBot(activity.pusher) || /^0+$/.test(activity.after)) continue;
+        if (activity.timestamp <= cursor || isBot(activity.actor) || /^0+$/.test(activity.after)) continue;
         const pulls = open.filter(
           p => p.head.repo?.full_name === branches.repo && `refs/heads/${p.head.ref}` === activity.ref
         );
@@ -452,9 +452,9 @@ export const githubTracker = (
             bot: false,
             issue: pull.number,
             kind: 'commit',
-            actor: login(activity.pusher),
-            trusted: !trust || trust.includes(login(activity.pusher)),
-            at: activity.pushed_at,
+            actor: login(activity.actor),
+            trusted: !trust || trust.includes(login(activity.actor)),
+            at: activity.timestamp,
             commit: { sha: activity.after, title: 'Branch updated' },
           });
       }

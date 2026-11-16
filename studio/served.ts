@@ -68,7 +68,8 @@ const readInstanceServed = async ({ root, graph: explicit }: StudioInstances, na
   const { readInstance, ensureInstanceGraph } = await readModule<typeof InstanceModule>('src/instance.ts');
   const { readInstanceEnv } = await readModule<typeof MainModule>('src/main.ts');
   const { makeTrackerSetup, settings } = await readModule<typeof ServicesModule>('src/services.ts');
-  const { ConfigProvider, Effect } = await import('effect');
+  const { Tracker } = await readModule<typeof TrackerModule>('src/tracker.ts');
+  const { ConfigProvider, Effect, Layer, Stream } = await import('effect');
   const files = [join(root, name, 'instance.yaml')];
   let data: string | undefined;
   try {
@@ -77,20 +78,42 @@ const readInstanceServed = async ({ root, graph: explicit }: StudioInstances, na
     data = instance.data;
     if (instance.env) files.push(instance.env);
     const scope = await readInstanceEnv(instance, readChoice());
+    const provide = Effect.provideService(ConfigProvider.ConfigProvider, scope.config);
     const whyTracker = `the tracker folder ${instance.tracker} has no origin.git; restore it, or move ${instance.dir} aside to start anew`;
     if (scope.env.AGENTGRAPH_TRACKER === 'folder' && !existsSync(join(instance.tracker, 'origin.git')))
       throw new Error(whyTracker);
     const dir = await ensureInstanceGraph(instance, explicit ?? scope.env.AGENTGRAPH_DIR);
     scope.env.AGENTGRAPH_DIR = dir;
-    const current = await Effect.runPromise(
-      settings.pipe(Effect.provideService(ConfigProvider.ConfigProvider, scope.config))
-    );
+    const current = await Effect.runPromise(settings.pipe(provide));
     const setup = await makeTrackerSetup(current);
     if (setup.origin.local && !existsSync(setup.origin.origin)) throw new Error(whyTracker);
     const loaded = await loadGraph(dir, instance, scope);
     const host = await makeServedHost(instance.data, loaded.graph, {
-      layer: setup.layer(loaded.graph?.trust ?? current.trust, instance.owner),
-      origin: setup.origin,
+      layer: Layer.effect(
+        Tracker,
+        Effect.map(
+          Effect.provide(Tracker, setup.layer(loaded.graph?.trust ?? current.trust, instance.owner)).pipe(provide),
+          tracker =>
+            Tracker.of({
+              ...tracker,
+              issues: filter => tracker.issues(filter).pipe(provide),
+              issue: number => tracker.issue(number).pipe(provide),
+              since: (cursor, columns) =>
+                tracker.since(cursor, columns).pipe(Stream.provideService(ConfigProvider.ConfigProvider, scope.config)),
+            })
+        )
+      ),
+      origin: {
+        ...setup.origin,
+        ...(setup.origin.token && { token: setup.origin.token.pipe(provide) }),
+        ...(setup.origin.fork && {
+          fork: {
+            ...setup.origin.fork,
+            ...(setup.origin.fork.token && { token: setup.origin.fork.token.pipe(provide) }),
+            ...(setup.origin.fork.pushToken && { pushToken: setup.origin.fork.pushToken.pipe(provide) }),
+          },
+        }),
+      },
     });
     return {
       name,
