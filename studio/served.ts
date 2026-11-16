@@ -69,7 +69,7 @@ const readInstanceServed = async ({ root, graph: explicit }: StudioInstances, na
   const { readInstanceEnv } = await readModule<typeof MainModule>('src/main.ts');
   const { makeTrackerSetup, settings } = await readModule<typeof ServicesModule>('src/services.ts');
   const { Tracker } = await readModule<typeof TrackerModule>('src/tracker.ts');
-  const { ConfigProvider, Effect, Layer, Stream } = await import('effect');
+  const { ConfigProvider, Effect, Layer } = await import('effect');
   const files = [join(root, name, 'instance.yaml')];
   let data: string | undefined;
   try {
@@ -91,17 +91,7 @@ const readInstanceServed = async ({ root, graph: explicit }: StudioInstances, na
     const host = await makeServedHost(instance.data, loaded.graph, {
       layer: Layer.effect(
         Tracker,
-        Effect.map(
-          Effect.provide(Tracker, setup.layer(loaded.graph?.trust ?? current.trust, instance.owner)).pipe(provide),
-          tracker =>
-            Tracker.of({
-              ...tracker,
-              issues: filter => tracker.issues(filter).pipe(provide),
-              issue: number => tracker.issue(number).pipe(provide),
-              since: (cursor, columns) =>
-                tracker.since(cursor, columns).pipe(Stream.provideService(ConfigProvider.ConfigProvider, scope.config)),
-            })
-        )
+        Effect.provide(Tracker, setup.layer(loaded.graph?.trust ?? current.trust, instance.owner)).pipe(provide)
       ),
       origin: {
         ...setup.origin,

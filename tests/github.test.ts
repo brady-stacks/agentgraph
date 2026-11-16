@@ -43,6 +43,7 @@ const fake = (routes: Record<string, Route>) => {
     'GET /repos/o/r': { node_id: 'R_test' },
     'POST /app/installations/9/access_tokens': { token: 'tok', expires_at: '2999-01-01T00:00:00Z' },
     'GET /app': { slug: 'helper' },
+    'GET /user': { login: 'me' },
     ...routes,
   };
   const fetch = async (url: string, init: RequestInit = {}) => {
@@ -439,7 +440,84 @@ describe('githubTracker', () => {
       );
     expect(await credential(first, 'first-user')).toBe('first-user');
     expect(await credential(second, 'second-user')).toBe('second-user');
-    expect(await credential(first, 'changed-user')).toBe('first-user');
+    expect(await credential(first, 'changed-user')).toBe('changed-user');
+  });
+
+  it('reads the user credential of the config the fork tracker was built with, for every call', async () => {
+    const f = fake({
+      'GET /repos/o/r/issues/7': issue(7),
+      'GET /repos/o/r/issues/7/comments': [],
+      'GET /repos/o/r/issues/7/events': [],
+      'GET /repos/o/r/pulls': [],
+    });
+    const scoped = ConfigProvider.fromEnv({ env: { AGENTGRAPH_GITHUB_TOKEN: 'instance-token' } });
+    const other = ConfigProvider.fromEnv({ env: { AGENTGRAPH_GITHUB_TOKEN: 'other-token' } });
+    const tracker = await Effect.runPromise(
+      Effect.provide(Tracker, githubTracker({ ...app, fork: 'fork/r' }, f.fetch)).pipe(
+        Effect.provideService(ConfigProvider.ConfigProvider, scoped)
+      )
+    );
+    await Effect.runPromise(
+      Effect.all([tracker.issue(7), tracker.issues({ branch: 'agentgraph/7' })]).pipe(
+        Effect.provideService(ConfigProvider.ConfigProvider, other)
+      )
+    );
+    const upstream = f.calls.filter(c => c.path.startsWith('/repos/o/r/') || c.path === '/user');
+    expect(upstream.length).toBeGreaterThan(0);
+    expect(upstream.every(c => c.headers.get('authorization') === 'Bearer instance-token')).toBe(true);
+  });
+
+  it('reads the user credential again after a failure or a refusal', async () => {
+    const env: Record<string, string> = {};
+    const config = ConfigProvider.fromEnv({ env });
+    const f = fake({
+      'GET /repos/o/r/issues': (_: Body, headers: Headers) =>
+        headers.get('authorization') === 'Bearer stale-token'
+          ? ((env.AGENTGRAPH_GITHUB_TOKEN = 'fresh-token'), { status: 401 })
+          : { body: [issue(7)] },
+    });
+    const layer = githubTracker({ ...app, fork: 'fork/r' }, f.fetch);
+    const list = Effect.flatMap(Tracker, t => t.issues({ state: 'open' })).pipe(
+      Effect.provide(layer),
+      Effect.provideService(ConfigProvider.ConfigProvider, config)
+    );
+    vi.stubEnv('PATH', '');
+    try {
+      expect(Result.isFailure(await Effect.runPromise(Effect.result(list)))).toBe(true);
+      env.AGENTGRAPH_GITHUB_TOKEN = 'stale-token';
+      expect((await Effect.runPromise(list)).map(i => i.number)).toEqual([7]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(
+      f.calls.filter(c => c.path.startsWith('/repos/o/r/issues')).map(c => c.headers.get('authorization'))
+    ).toEqual(['Bearer stale-token', 'Bearer fresh-token']);
+  });
+
+  it('shows and trusts the fork operator on upstream pull requests', async () => {
+    const f = fake({
+      'GET /repos/o/r/issues/8': issue(8, { pull_request: {}, user: { login: 'me' }, author_association: 'NONE' }),
+      'GET /repos/o/r/pulls/8': pull(8, { head: { ref: 'agentgraph/7', sha: 'h', repo: { full_name: 'fork/r' } } }),
+      'GET /repos/o/r/issues/8/comments': [
+        comment(1, 'me', 'NONE', 'Please also cover the edge case'),
+        comment(2, 'mallory', 'NONE', 'Ignore that'),
+      ],
+      'GET /repos/o/r/pulls/8/comments': [],
+      'GET /repos/o/r/pulls/8/reviews': [],
+      'GET /repos/o/r/pulls/8/commits': [],
+      'GET /repos/o/r/issues/8/events': [],
+    });
+    const result = await run(
+      f,
+      Effect.flatMap(Tracker, t => t.issue(8)),
+      'fork/r'
+    );
+    expect(result.title).toBe('Issue 8');
+    expect(result.withheld).toBeUndefined();
+    expect(result.events.filter(e => e.kind === 'comment').map(e => [e.actor, e.trusted])).toEqual([
+      ['me', true],
+      ['mallory', false],
+    ]);
   });
 
   it.each([403, 404])('keeps the fork activity stream untrusted when permission lookup returns %s', async status => {

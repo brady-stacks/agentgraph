@@ -205,6 +205,7 @@ it.each(['issues', 'issue', 'since'] as const)(
       };
       const routes: Record<string, unknown> = {
         '/app': { slug: 'helper' },
+        '/user': { login: 'o' },
         '/repos/fork/project/installation': { id: 9 },
         '/app/installations/9/access_tokens': { token: 'fork-app', expires_at: '2999-01-01T00:00:00Z' },
         '/repos/fork/project/activity': [],

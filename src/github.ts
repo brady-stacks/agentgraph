@@ -1,7 +1,19 @@
 import { execFile } from 'node:child_process';
 import { createPrivateKey, sign } from 'node:crypto';
 import { promisify } from 'node:util';
-import { Clock, Config, Effect, Layer, Option, Redacted, Schedule, Stream, Semaphore, Struct } from 'effect';
+import {
+  Clock,
+  Config,
+  ConfigProvider,
+  Effect,
+  Layer,
+  Option,
+  Redacted,
+  Schedule,
+  Stream,
+  Semaphore,
+  Struct,
+} from 'effect';
 import {
   makeCommentWithAgentRequest,
   parseIssueLinks,
@@ -348,19 +360,23 @@ const appToken = (
 
 const makeUpstreamToken = (app: Parameters<typeof appToken>[0] & Pick<TrackerHost, 'fork'>, fetch: Fetch): AppToken => {
   if (!app.fork) return appToken(app, fetch);
-  const token = Effect.runSync(
-    Effect.cached(
-      readUserToken('AGENTGRAPH_GITHUB_TOKEN').pipe(
+  const kept = new WeakMap<ConfigProvider.ConfigProvider, { value: string; until: number }>();
+  return (_scope, refused) =>
+    Effect.gen(function* () {
+      const config = yield* ConfigProvider.ConfigProvider;
+      const token = kept.get(config);
+      if (token && token.value !== refused && token.until > Date.now()) return token.value;
+      const value = yield* readUserToken('AGENTGRAPH_GITHUB_TOKEN').pipe(
         Effect.mapError(
           () =>
             new TrackerError({
               message: 'Fork pull requests need user credentials: run gh auth login, or set AGENTGRAPH_GITHUB_TOKEN.',
             })
         )
-      )
-    )
-  );
-  return () => token;
+      );
+      kept.set(config, { value, until: Date.now() + roleMs });
+      return value;
+    });
 };
 
 // UNEXPECTED: a token GitHub narrows to some repos or permissions loses private contents and pull requests ~10s after it is minted, answering 404; a new token reads them again.
@@ -388,6 +404,15 @@ const asApp = <T>(
   );
 };
 
+const missing = <A, R>(effect: Effect.Effect<A, TrackerError, R>) =>
+  Effect.catchIf(
+    effect,
+    e => e.status === 404,
+    () => Effect.succeed(undefined)
+  );
+const listState = (state?: Issue['state']) => (state === undefined ? 'all' : state === 'open' ? 'open' : 'closed');
+const refuse = (message: string, moved?: true) => new TrackerError({ status: 422, message, ...(moved && { moved }) });
+
 /** @internal */
 export const githubTracker = (
   app: Parameters<typeof appToken>[0] & Pick<TrackerHost, 'fork'>,
@@ -402,10 +427,10 @@ export const githubTracker = (
     const [owner, name] = repo.split('/') as [string, string];
     return { repo, path: `/repos/${repo}`, token, owner, name };
   };
-  const upstream = makeTarget(app.repo, token);
-  const branches = app.fork ? makeTarget(app.fork, appToken({ ...app, repo: app.fork }, fetch)) : upstream;
-  const forked = branches !== upstream;
-  const all = <T>(target: typeof upstream, path: string, more: (page: T[]) => boolean = () => true) =>
+  const unscoped = makeTarget(app.repo, token);
+  const branches = app.fork ? makeTarget(app.fork, appToken({ ...app, repo: app.fork }, fetch)) : unscoped;
+  const forked = branches !== unscoped;
+  const all = <T>(target: typeof unscoped, path: string, more: (page: T[]) => boolean = () => true) =>
     Effect.gen(function* () {
       const items: T[] = [];
       let url: string | undefined = path;
@@ -461,17 +486,33 @@ export const githubTracker = (
       return found;
     });
   const roles = new Map<string, { until: number; read: Effect.Effect<boolean, TrackerError> }>();
-  return Layer.sync(Tracker, () => {
-    const listed = (user: User, association = '') => (trust ? trust.includes(login(user)) : members.has(association));
-    const repo = upstream.path;
+  const build = (config: ConfigProvider.ConfigProvider) => {
+    const scoped = <A, E>(effect: Effect.Effect<A, E>) =>
+      Effect.provideService(effect, ConfigProvider.ConfigProvider, config);
+    const upstream = { ...unscoped, token: ((scope, refused) => scoped(token(scope, refused))) satisfies AppToken };
+    const boardToken = scoped(projectToken);
     let slug: string | undefined;
+    let operator: string | undefined;
+    const listed = (user: User, association = '') =>
+      login(user) === operator || (trust ? trust.includes(login(user)) : members.has(association));
+    const repo = upstream.path;
 
-    const me = Effect.suspend(() =>
-      slug !== undefined
-        ? Effect.succeed(slug)
-        : asApp(app, signed => request<{ slug: string }>('GET', '/app', signed)).pipe(
-            Effect.map(({ data }) => (slug = data.slug))
+    const readOperator = Effect.suspend(() =>
+      !forked || operator !== undefined
+        ? Effect.void
+        : authed(upstream.token, 'read', t => request<User>('GET', '/user', t)).pipe(
+            Effect.map(({ data }) => void (operator = login(data)))
           )
+    );
+    const me = Effect.andThen(
+      readOperator,
+      Effect.suspend(() =>
+        slug !== undefined
+          ? Effect.succeed(slug)
+          : asApp(app, signed => request<{ slug: string }>('GET', '/app', signed)).pipe(
+              Effect.map(({ data }) => (slug = data.slug))
+            )
+      )
     );
 
     const gh = <T>(
@@ -482,13 +523,6 @@ export const githubTracker = (
       scope: TokenScope = 'read',
       version?: string
     ) => authed(target.token, scope, t => request<T>(method, path, t, body, version)).pipe(Effect.map(r => r.data));
-
-    const missing = <A, R>(effect: Effect.Effect<A, TrackerError, R>) =>
-      Effect.catchIf(
-        effect,
-        e => e.status === 404,
-        () => Effect.succeed(undefined)
-      );
 
     const toIssue = (i: RestIssue, self: string, pull?: RestPull, parent?: number): Issue => {
       const own = pull?.head.repo?.full_name === branches.repo;
@@ -584,8 +618,6 @@ export const githubTracker = (
           ...(kind === 'review_requested' && reviewer !== undefined && { reviewer }),
         } satisfies Event;
       });
-
-    const listState = (state?: Issue['state']) => (state === undefined ? 'all' : state === 'open' ? 'open' : 'closed');
 
     const issues: Tracker['Service']['issues'] = (filter = {}) =>
       Effect.gen(function* () {
@@ -688,9 +720,9 @@ export const githubTracker = (
         const [said, parent, pull, lined, reviews, commits, events] = yield* Effect.all(
           [
             all<RestComment>(upstream, `${repo}/issues/${number}/comments?per_page=100`),
-            authed(token, 'read', t => missing(request<RestIssue>('GET', `${repo}/issues/${number}/parent`, t))).pipe(
-              Effect.map(r => r?.data)
-            ),
+            authed(upstream.token, 'read', t =>
+              missing(request<RestIssue>('GET', `${repo}/issues/${number}/parent`, t))
+            ).pipe(Effect.map(r => r?.data)),
             isPull ? gh<RestPull>(upstream, 'GET', `${repo}/pulls/${number}`) : Effect.succeed(undefined),
             isPull ? all<RestLineComment>(upstream, `${repo}/pulls/${number}/comments?per_page=100`) : none,
             isPull ? all<RestReview>(upstream, `${repo}/pulls/${number}/reviews?per_page=100`) : none,
@@ -765,7 +797,7 @@ export const githubTracker = (
     const columns = Effect.runSync(
       Effect.cached(
         Effect.gen(function* () {
-          const auth = yield* projectToken;
+          const auth = yield* boardToken;
           const [owner, name] = app.repo.split('/');
           const found: Event[] = [];
           let after: string | null = null;
@@ -886,8 +918,6 @@ export const githubTracker = (
 
     const pushed = new Map<string, { sha: string; tree: string }>();
     const held = new Map<string, Set<string>>();
-    const refuse = (message: string, moved?: true) =>
-      new TrackerError({ status: 422, message, ...(moved && { moved }) });
     let repositoryId: string | undefined;
     const rewrite = (branch: string, before: string, after: string) =>
       Effect.gen(function* () {
@@ -1368,7 +1398,7 @@ export const githubTracker = (
       slug: me,
       writeField: (number, { project: where, field, value }) =>
         Effect.gen(function* () {
-          const auth = yield* projectToken;
+          const auth = yield* boardToken;
           const [owner, name] = app.repo.split('/');
           const [login, board] = where.split('/');
           const found = yield* graphql<Board>(auth, boardQuery, {
@@ -1410,7 +1440,8 @@ export const githubTracker = (
     };
     if (!forked) return tracker;
     return Struct.omit(tracker, ['status', 'writeStatusHeader', 'writeField']);
-  });
+  };
+  return Layer.effect(Tracker, Effect.map(ConfigProvider.ConfigProvider, build));
 };
 
 export const readInstallationReach = (
