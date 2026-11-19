@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.0.3
+
+### Patch Changes
+
+Data folders and tracker folders from 0.0.2 are not read as they are. Start a new instance after upgrading.
+
+#### CLI
+
+- Flags are parsed per verb. A flag the verb does not take exits with code 2, and `agi <verb> --help` lists its flags.
+- `--forge` is now `--tracker`, and `AGENTGRAPH_FORGE` is now `AGENTGRAPH_TRACKER`.
+- Named instances: `--instance <name>` picks `<data root>/<name>/instance.yaml`, which keeps the checkout, tracker, repo and trust. Graph settings no longer take `repo` or `trust`.
+- Settings come from flags, then the instance env file, then `instance.yaml`, then the shell.
+- New verbs: `stop`, `restart`, `resume <run id>` and `resume --parked`, `label`, and `import <commit>|<patch>`.
+- `dispatch <n>` takes an optional request text.
+- `loop --detach` runs in the background. Repeat `--instance` to drive several instances in one loop, with `--parallel` as a shared cap.
+- `start --run-label k=v` and `agi label` attach free labels to runs.
+- The engine no longer falls back to a default graph. Copy `examples/starter` from the package into `.agentgraph/`.
+
+#### Workflows and graphs
+
+- Comment commands use colons: `/agent:stop`, `/agent:cancel`, `/agent:restart[:<step>]` and `/agent:<workflow>`. `commands` in `settings.yaml` limits who may use them.
+- Agents take `session: fresh` or `session: same`.
+- `on: conflict` workflows and a wait step's `conflict` setting handle a base that moved under a waiting run.
+- `on: feedback` also starts a retro when a run ends. `restarts: true` includes runs stopped by a restart.
+- `run` steps get the run's traces with `reads: traces`, and their proposals are limited by their own `returns`.
+- Issues stack only with `stacks: true` in `settings.yaml`. `Depends on` and `Stacks on` holds say what the run waits for.
+- `agent:usd-per-run:<n>` and `agent:minutes:<n>` labels raise an issue's limits up to `limits.max`.
+- Graph and step `limits` take `memory` and `cpus` for containers.
+- A run parked by an engine error retries on a reply or `agi resume --parked`.
+
+#### Sandbox and runners
+
+- Commands run through a runner picked with `--runner`, `AGENTGRAPH_RUNNER` or `runner:` in `instance.yaml`. `local` is the default. `AGENTGRAPH_SANDBOX_URL` alone no longer picks `box`.
+- Sessions whose tools only read get read-only checkouts, and runs with only read-only agents skip setup.
+- Toolchain caches are per repo, with `AGENTGRAPH_CACHE_VOLUME` as the volume name prefix.
+- Below `AGENTGRAPH_MIN_FREE_GB` (40) free disk the engine warns and keeps working. `AGENTGRAPH_DISK_LOW=block` makes it wait.
+- Checkouts get a private `/scratch`. A browser image with headless Chromium builds from `infra/local/sandbox/browser`.
+- The egress proxy also reads `egress/allowlist` in the data folder.
+- Ended runs idle for `AGENTGRAPH_COMPRESS_DAYS` (14) days have their trace and checks compressed with zstd.
+- `run.json` records the engine, image, config and harness versions in `versions`.
+- The `chatgpt` provider also serves the opencode and pi harnesses.
+
+#### Trackers
+
+- Issue status is one label: `agent:working`, `agent:needs-review`, `agent:needs-answer`, `agent:done` or `agent:stopped`. `status` in `settings.yaml` renames or turns them off.
+- The status sits in a header at the top of the issue body, then the pull request body. The engine no longer posts status comments.
+- Workflows can start when an issue enters a project board column: `on: { issues: { column: <name> } }`.
+- The loop sends far fewer requests. It keeps tokens and ETags across passes and waits out rate limits.
+- A restart after a closed, unmerged pull request starts on a fresh `-2` branch.
+- In a tracker folder, each issue lives in `<n>/issue.md` with `events.jsonl`, and its status is the folder it sits in. The old flat layout is refused.
+
+#### Studio
+
+- The studio asks for a login. By default it prints a login URL with a token.
+- One studio serves several instances. Pages live under `/<instance>/`, and `/runs` lists runs across instances.
+- The Inbox tab is gone. The Runs page filters runs waiting for people and shows run labels.
+- Graph edits reload without a restart.
+
+#### Bench
+
+- The bench is a view over runs, driven by `node bench/start-runs.ts`. Its studio page is an example plugin in `examples/plugins/bench`.
+
+#### Plugins and SDK
+
+- The package exports `@jannik-stacks/agi/plugins`, `@jannik-stacks/agi/trackers` and `@jannik-stacks/agi/runners`.
+- Graph plugins in `plugins/` can add tools, `on.status` hooks, trackers, runners, studio auth and studio pages.
+- The built-in trackers and runners are exported for plugins to wrap. `makeBoxRunner` builds a box runner, as in `examples/plugins/modal`.
+- The engine runs on Effect 4. Errors in settings and frontmatter use its wording.
+
 ## 0.0.2
 
 ### Patch Changes
